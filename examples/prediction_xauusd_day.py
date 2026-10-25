@@ -29,10 +29,16 @@ Description:
          * reports the ensemble mean plus 5-95% / 25-75% quantile bands and
            probability metrics (upside/downside probability, VaR/CVaR,
            max drawdown);
+         * calibrates the ensemble volatility post-hoc (see calibrate_vol):
+           each path's deviation from the ensemble mean is rescaled so the
+           per-horizon spread matches the recent realized daily vol
+           (sigma_d * sqrt(t)), fixing Kronos's ~2-5x vol compression while
+           leaving the mean path (and thus MAPE/bias) untouched;
          * runs a rolling walk-forward backtest (5 non-overlapping 30-day
            windows at the tail of the file, which lies inside the fine-tuning
            validation split) tracking MAPE, signed bias, return correlation,
-           direction accuracy and realized-vol ratio per window/regime.
+           direction accuracy, realized-vol ratio and prediction-interval
+           coverage per window/regime.
 
     Forward vs in-sample
     --------------------
@@ -118,6 +124,8 @@ TOP_P = 0.9
 SAMPLE_COUNT = 32   # Monte Carlo ensemble size (one batched AR loop)
 PRICE_COLS = ["open", "high", "low", "close"]
 CLOSE_IDX = 3       # index of 'close' in the model's 6 output channels
+PRICE_IDX = (0, 1, 2, 3)  # open, high, low, close in the model's 6 output channels
+VOL_LOOKBACK = 30   # history days used to estimate the recent realized vol (vol-targeting)
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +330,64 @@ def sample_paths(predictor: KronosPredictor, x_df: pd.DataFrame, x_timestamp: pd
 
 
 # ---------------------------------------------------------------------------
+# Volatility calibration (post-hoc vol-targeting)
+# ---------------------------------------------------------------------------
+def calibrate_vol(paths: np.ndarray, hist_close: np.ndarray,
+                  vol_lookback: int = VOL_LOOKBACK, max_scale: float = 5.0) -> np.ndarray:
+    """Rescale each path's deviation from the ensemble mean so the ensemble's
+    per-horizon spread matches the asset's recent realized volatility.
+
+    Kronos is trained to reconstruct price levels, so its sampled paths are
+    too smooth: the ensemble's day-to-day dispersion comes out ~2-5x smaller
+    than gold's realized vol, which makes the quantile bands, VaR/CVaR and
+    up/down probabilities unrealistically tight. This post-hoc fix rescales
+    each path's DEVIATION FROM THE ENSEMBLE MEAN (never the mean itself), so:
+
+      * the ensemble mean path is unchanged -> MAPE / bias are unaffected;
+      * the per-horizon spread is driven to sigma_d * sqrt(t) (Brownian
+        scaling), where sigma_d is the std of the last `vol_lookback`
+        realized daily returns (recent regime, not the full lookback);
+      * all four price channels are scaled by the same per-horizon factor
+        (each around its own channel mean), so the OHLC envelope is kept.
+
+    The scale factor is capped at `max_scale` to avoid amplifying sampling
+    noise when the model emits near-identical paths.
+    """
+    hist = np.asarray(hist_close, dtype=float)
+    h = hist[-(vol_lookback + 1):]
+    if len(h) < 3:
+        print("⚠️  Vol calibration skipped: not enough history.")
+        return paths
+    r = np.diff(h) / h[:-1]
+    sigma_d = float(np.std(r))
+    if sigma_d <= 0:
+        print("⚠️  Vol calibration skipped: zero realized vol in history.")
+        return paths
+
+    n, H, _ = paths.shape
+    mean_close = paths[:, :, CLOSE_IDX].mean(axis=0)
+    t = np.arange(1, H + 1, dtype=float)
+
+    out = paths.copy()
+    scales = []
+    for i in range(H):
+        cur = float(np.std(paths[:, i, CLOSE_IDX] - mean_close[i]) / mean_close[i])
+        target = sigma_d * np.sqrt(t[i])
+        s = min(target / cur, max_scale) if cur > 1e-8 else 0.0
+        scales.append(s)
+        for c in PRICE_IDX:
+            ch = out[:, i, c]
+            m = float(ch.mean())
+            out[:, i, c] = m + (ch - m) * s
+
+    cur_final = float(np.std(paths[:, -1, CLOSE_IDX] - mean_close[-1]) / mean_close[-1])
+    print(f"🎯 Vol calibration: sigma_d (last {vol_lookback}d) = {sigma_d * 100:.3f}%/day; "
+          f"final-horizon spread {cur_final * 100:.2f}% -> {cur_final * scales[-1] * 100:.2f}% "
+          f"(target {sigma_d * np.sqrt(H) * 100:.2f}%, scale {scales[-1]:.2f}x)")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Distribution analysis
 # ---------------------------------------------------------------------------
 def summarize_paths(paths: np.ndarray, y_timestamp: pd.Series) -> pd.DataFrame:
@@ -380,6 +446,7 @@ def probability_metrics(paths: np.ndarray, ref_price: float, var_level: float = 
 def run_backtest(predictor: KronosPredictor, df: pd.DataFrame, lookback: int,
                  pred_len: int, n_windows: int, n_paths: int,
                  T: float, top_k: int, top_p: float,
+                 vol_calibration: bool = True,
                  up_thresh: float = 0.02, down_thresh: float = -0.02):
     """Rolling walk-forward backtest over the tail of the file.
 
@@ -390,8 +457,10 @@ def run_backtest(predictor: KronosPredictor, df: pd.DataFrame, lookback: int,
     file allows.
 
     Per window we track: MAPE, signed bias, Pearson correlation of daily
-    close-to-close returns, direction accuracy, realized-vol ratio, and the
-    window regime (up / down / sideways by the window's actual return).
+    close-to-close returns, direction accuracy, realized-vol ratio, prediction-
+    interval coverage (fraction of actual closes inside the 5-95% / 25-75%
+    bands — a well-calibrated 5-95% band should contain ~90%), and the window
+    regime (up / down / sideways by the window's actual return).
 
     Returns the metrics DataFrame and saves to outputs/: the per-window
     metrics CSV, the per-day predicted-vs-actual CSV, a pooled correlation
@@ -411,6 +480,10 @@ def run_backtest(predictor: KronosPredictor, df: pd.DataFrame, lookback: int,
 
         paths = sample_paths(predictor, x_df, x_timestamp, y_timestamp,
                              pred_len, n_paths, T=T, top_k=top_k, top_p=top_p)
+        if vol_calibration:
+            # Honest walk-forward: sigma_d is estimated from the history
+            # available at this window's start (x_df), not the file tail.
+            paths = calibrate_vol(paths, x_df["close"].values)
         pred_close = paths[:, :, CLOSE_IDX].mean(axis=0)
         actual_close = df["close"].iloc[len(df) - pred_len - end_offset: len(df) - end_offset].values
 
@@ -443,6 +516,12 @@ def run_backtest(predictor: KronosPredictor, df: pd.DataFrame, lookback: int,
         else:
             regime = "sideways"
 
+        summary = summarize_paths(paths, y_timestamp)
+        lo90, hi90 = summary["lower"].values, summary["upper"].values
+        lo50, hi50 = summary["mid_low"].values, summary["mid_high"].values
+        coverage_90 = float(np.mean((actual_close >= lo90) & (actual_close <= hi90)))
+        coverage_50 = float(np.mean((actual_close >= lo50) & (actual_close <= hi50)))
+
         rows.append({
             "window": w + 1,
             "start": y_timestamp.iloc[0],
@@ -455,9 +534,10 @@ def run_backtest(predictor: KronosPredictor, df: pd.DataFrame, lookback: int,
             "ret_corr": round(corr, 3),
             "dir_acc": round(dir_acc, 3),
             "vol_ratio": round(vol_ratio, 3),
+            "coverage_90": round(coverage_90, 3),
+            "coverage_50": round(coverage_50, 3),
         })
-        window_segments.append((y_timestamp, pred_close, actual_close,
-                                summarize_paths(paths, y_timestamp)))
+        window_segments.append((y_timestamp, pred_close, actual_close, summary))
 
     bt_df = pd.DataFrame(rows)
     out_csv = os.path.join(save_dir, "backtest_XAUUSD_1d.csv")
@@ -591,7 +671,8 @@ def plot_result(df_hist: pd.DataFrame, pred_df: pd.DataFrame, summary: pd.DataFr
 
 def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
                    n_paths: int, T: float, top_k: int, top_p: float,
-                   use_pretrained: bool, do_backtest: bool, n_backtest_windows: int):
+                   use_pretrained: bool, do_backtest: bool, n_backtest_windows: int,
+                   vol_calibration: bool = True):
     tok_name, model_name = resolve_model_paths(use_pretrained)
     print(f"🚀 Loading Kronos tokenizer: {tok_name}")
     print(f"   Loading Kronos model:      {model_name}")
@@ -607,6 +688,9 @@ def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
           f"[{mode}, lookback={lookback}, T={T}, top_p={top_p}, device={DEVICE}] ...")
     paths = sample_paths(predictor, x_df, x_timestamp, y_timestamp,
                          pred_len, n_paths, T=T, top_k=top_k, top_p=top_p, verbose=True)
+
+    if vol_calibration:
+        paths = calibrate_vol(paths, x_df["close"].values)
 
     mean_path = paths.mean(axis=0)  # (pred_len, 6)
     pred_df = pd.DataFrame(
@@ -648,7 +732,8 @@ def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
     if do_backtest:
         print(f"\n🔁 Running rolling walk-forward backtest ({n_backtest_windows} windows) ...")
         run_backtest(predictor, df, lookback, pred_len, n_backtest_windows,
-                     n_paths, T=T, top_k=top_k, top_p=top_p)
+                     n_paths, T=T, top_k=top_k, top_p=top_p,
+                     vol_calibration=vol_calibration)
 
 
 if __name__ == "__main__":
@@ -667,6 +752,10 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=T, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=TOP_P, help="Nucleus sampling threshold")
     parser.add_argument("--top-k", type=int, default=0, help="Top-k filtering (0 = off)")
+    parser.add_argument("--vol-calibration", action=argparse.BooleanOptionalAction, default=True,
+                        help="Rescale each path's deviation from the ensemble mean so the "
+                             "per-horizon spread matches recent realized vol (default on). "
+                             "Use --no-vol-calibration to disable.")
     parser.add_argument("--no-backtest", action="store_true",
                         help="Skip the rolling walk-forward backtest")
     parser.add_argument("--backtest-windows", type=int, default=5,
@@ -685,4 +774,5 @@ if __name__ == "__main__":
         use_pretrained=args.pretrained,
         do_backtest=not args.no_backtest,
         n_backtest_windows=args.backtest_windows,
+        vol_calibration=args.vol_calibration,
     )
