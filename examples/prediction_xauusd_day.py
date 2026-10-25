@@ -33,7 +33,10 @@ Description:
            each path's deviation from the ensemble mean is rescaled so the
            per-horizon spread matches the recent realized daily vol
            (sigma_d * sqrt(t)), fixing Kronos's ~2-5x vol compression while
-           leaving the mean path (and thus MAPE/bias) untouched;
+           leaving the mean path (and thus MAPE/bias) untouched; the
+           ensemble is also mapped to a normal shape (rank -> Phi^-1
+           quantile) so the 25-75% / 5-95% bands contain 50% / 90% of mass
+           by construction (disable with --no-vol-shape);
          * runs a rolling walk-forward backtest (5 non-overlapping 30-day
            windows at the tail of the file, which lies inside the fine-tuning
            validation split) tracking MAPE, signed bias, return correlation,
@@ -65,6 +68,7 @@ Description:
 import os
 import argparse
 import sys
+import statistics
 
 import numpy as np
 import pandas as pd
@@ -126,6 +130,7 @@ PRICE_COLS = ["open", "high", "low", "close"]
 CLOSE_IDX = 3       # index of 'close' in the model's 6 output channels
 PRICE_IDX = (0, 1, 2, 3)  # open, high, low, close in the model's 6 output channels
 VOL_LOOKBACK = 30   # history days used to estimate the recent realized vol (vol-targeting)
+NORMAL = statistics.NormalDist()  # stdlib inverse normal CDF (scipy is not installed)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +338,8 @@ def sample_paths(predictor: KronosPredictor, x_df: pd.DataFrame, x_timestamp: pd
 # Volatility calibration (post-hoc vol-targeting)
 # ---------------------------------------------------------------------------
 def calibrate_vol(paths: np.ndarray, hist_close: np.ndarray,
-                  vol_lookback: int = VOL_LOOKBACK, max_scale: float = 5.0) -> np.ndarray:
+                  vol_lookback: int = VOL_LOOKBACK, max_scale: float = 5.0,
+                  shape: bool = True) -> np.ndarray:
     """Rescale each path's deviation from the ensemble mean so the ensemble's
     per-horizon spread matches the asset's recent realized volatility.
 
@@ -349,6 +355,18 @@ def calibrate_vol(paths: np.ndarray, hist_close: np.ndarray,
         realized daily returns (recent regime, not the full lookback);
       * all four price channels are scaled by the same per-horizon factor
         (each around its own channel mean), so the OHLC envelope is kept.
+
+    With `shape=True` (default) the fix also corrects the ensemble's SHAPE,
+    not just its scale. A near-degenerate ensemble is concentrated near the
+    mean, so a single linear scale cannot fix both the inner (25-75%) and
+    outer (5-95%) bands at once. Instead each path's close is ranked and
+    mapped to its standard-normal quantile z = Phi^-1((rank - 0.5)/n)
+    (standardized to mean 0 / std 1), then every price channel is rebuilt
+    as channel_mean + z * channel_std * scale. The shared close-rank shock
+    keeps OHLC coherent, the ensemble is exactly normal-shaped at the
+    calibrated std (so the 5-95% / 25-75% bands contain 90% / 50% of mass
+    by construction), and the mean path is preserved exactly (mean of z = 0).
+    With `shape=False` the original pure linear scale is applied.
 
     The scale factor is capped at `max_scale` to avoid amplifying sampling
     noise when the model emits near-identical paths.
@@ -368,6 +386,13 @@ def calibrate_vol(paths: np.ndarray, hist_close: np.ndarray,
     mean_close = paths[:, :, CLOSE_IDX].mean(axis=0)
     t = np.arange(1, H + 1, dtype=float)
 
+    # Standardized normal-quantile table for an ensemble of size n: path of
+    # rank k (1-based) maps to Phi^-1((k - 0.5)/n), standardized to mean 0 /
+    # std 1. Fixed for a given n, so compute the n inv_cdf calls once.
+    k = np.arange(1, n + 1)
+    z_table = np.array([NORMAL.inv_cdf((ki - 0.5) / n) for ki in k])
+    z_table = (z_table - z_table.mean()) / z_table.std()
+
     out = paths.copy()
     scales = []
     for i in range(H):
@@ -375,15 +400,30 @@ def calibrate_vol(paths: np.ndarray, hist_close: np.ndarray,
         target = sigma_d * np.sqrt(t[i])
         s = min(target / cur, max_scale) if cur > 1e-8 else 0.0
         scales.append(s)
-        for c in PRICE_IDX:
-            ch = out[:, i, c]
-            m = float(ch.mean())
-            out[:, i, c] = m + (ch - m) * s
+        if shape:
+            # Probability integral transform: rank the ensemble's closes and
+            # map each path to its normal quantile (stable sort keeps ties
+            # in their original order).
+            order = np.argsort(paths[:, i, CLOSE_IDX], kind="stable")
+            rank_pos = np.empty(n, dtype=int)
+            rank_pos[order] = np.arange(n)
+            z = z_table[rank_pos]
+            for c in PRICE_IDX:
+                ch = out[:, i, c]
+                m = float(ch.mean())
+                sc = float(ch.std())
+                out[:, i, c] = m + z * sc * s
+        else:
+            for c in PRICE_IDX:
+                ch = out[:, i, c]
+                m = float(ch.mean())
+                out[:, i, c] = m + (ch - m) * s
 
     cur_final = float(np.std(paths[:, -1, CLOSE_IDX] - mean_close[-1]) / mean_close[-1])
+    shape_note = " + normal-quantile shape" if shape else ""
     print(f"🎯 Vol calibration: sigma_d (last {vol_lookback}d) = {sigma_d * 100:.3f}%/day; "
           f"final-horizon spread {cur_final * 100:.2f}% -> {cur_final * scales[-1] * 100:.2f}% "
-          f"(target {sigma_d * np.sqrt(H) * 100:.2f}%, scale {scales[-1]:.2f}x)")
+          f"(target {sigma_d * np.sqrt(H) * 100:.2f}%, scale {scales[-1]:.2f}x{shape_note})")
     return out
 
 
@@ -446,7 +486,7 @@ def probability_metrics(paths: np.ndarray, ref_price: float, var_level: float = 
 def run_backtest(predictor: KronosPredictor, df: pd.DataFrame, lookback: int,
                  pred_len: int, n_windows: int, n_paths: int,
                  T: float, top_k: int, top_p: float,
-                 vol_calibration: bool = True,
+                 vol_calibration: bool = True, vol_shape: bool = True,
                  up_thresh: float = 0.02, down_thresh: float = -0.02):
     """Rolling walk-forward backtest over the tail of the file.
 
@@ -483,7 +523,7 @@ def run_backtest(predictor: KronosPredictor, df: pd.DataFrame, lookback: int,
         if vol_calibration:
             # Honest walk-forward: sigma_d is estimated from the history
             # available at this window's start (x_df), not the file tail.
-            paths = calibrate_vol(paths, x_df["close"].values)
+            paths = calibrate_vol(paths, x_df["close"].values, shape=vol_shape)
         pred_close = paths[:, :, CLOSE_IDX].mean(axis=0)
         actual_close = df["close"].iloc[len(df) - pred_len - end_offset: len(df) - end_offset].values
 
@@ -672,7 +712,7 @@ def plot_result(df_hist: pd.DataFrame, pred_df: pd.DataFrame, summary: pd.DataFr
 def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
                    n_paths: int, T: float, top_k: int, top_p: float,
                    use_pretrained: bool, do_backtest: bool, n_backtest_windows: int,
-                   vol_calibration: bool = True):
+                   vol_calibration: bool = True, vol_shape: bool = True):
     tok_name, model_name = resolve_model_paths(use_pretrained)
     print(f"🚀 Loading Kronos tokenizer: {tok_name}")
     print(f"   Loading Kronos model:      {model_name}")
@@ -690,7 +730,7 @@ def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
                          pred_len, n_paths, T=T, top_k=top_k, top_p=top_p, verbose=True)
 
     if vol_calibration:
-        paths = calibrate_vol(paths, x_df["close"].values)
+        paths = calibrate_vol(paths, x_df["close"].values, shape=vol_shape)
 
     mean_path = paths.mean(axis=0)  # (pred_len, 6)
     pred_df = pd.DataFrame(
@@ -733,7 +773,7 @@ def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
         print(f"\n🔁 Running rolling walk-forward backtest ({n_backtest_windows} windows) ...")
         run_backtest(predictor, df, lookback, pred_len, n_backtest_windows,
                      n_paths, T=T, top_k=top_k, top_p=top_p,
-                     vol_calibration=vol_calibration)
+                     vol_calibration=vol_calibration, vol_shape=vol_shape)
 
 
 if __name__ == "__main__":
@@ -756,6 +796,10 @@ if __name__ == "__main__":
                         help="Rescale each path's deviation from the ensemble mean so the "
                              "per-horizon spread matches recent realized vol (default on). "
                              "Use --no-vol-calibration to disable.")
+    parser.add_argument("--vol-shape", action=argparse.BooleanOptionalAction, default=True,
+                        help="Also map the ensemble to a normal shape (rank -> Phi^-1 quantile) "
+                             "so the 25-75%% / 5-95%% bands contain 50%% / 90%% of mass (default on). "
+                             "Use --no-vol-shape for the original pure linear scale.")
     parser.add_argument("--no-backtest", action="store_true",
                         help="Skip the rolling walk-forward backtest")
     parser.add_argument("--backtest-windows", type=int, default=5,
@@ -775,4 +819,5 @@ if __name__ == "__main__":
         do_backtest=not args.no_backtest,
         n_backtest_windows=args.backtest_windows,
         vol_calibration=args.vol_calibration,
+        vol_shape=args.vol_shape,
     )
