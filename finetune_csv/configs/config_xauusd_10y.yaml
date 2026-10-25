@@ -1,0 +1,97 @@
+# Config for fine-tuning Kronos on XAUUSD (gold spot) DAILY k-line CSV data (10y).
+#
+# Why fine-tune?
+#   The pre-trained Kronos-base is intraday-oriented and was never trained on
+#   gold, so out-of-the-box daily forecasts are weak. Fine-tuning the tokenizer
+#   + predictor on daily XAUUSD adapts the model to this asset/frequency.
+#
+# Data: data/XAUUSD_1d_10y.csv  (2093 rows, 2019-01-28 -> 2026-10-23, business days)
+#   Schema expected by CustomKlineDataset (finetune_csv/finetune_base_model.py):
+#     timestamps, open, high, low, close, volume, amount
+#   (volume/amount are all-zero for gold spot and are harmless - they normalize
+#    to ~0 and carry no signal)
+#
+# Split math (window = lookback 512 + predict 30 + 1 = 543):
+#   train 70% = 1465 rows -> 923 samples (28 steps/epoch @ batch 32, drop_last)
+#   val   30% =  628 rows ->  86 samples
+#   (the 5y config used 0.8/0.1/0.1 which gave val only 209 rows -> n_samples
+#    = 209 - 543 + 1 = -333 -> an EMPTY val loader -> val loss 0.0 -> the
+#    "best" model was saved after epoch 1. 0.7/0.3/0.0 fixes that.)
+#
+# Run:
+#   cd finetune_csv
+#   python train_sequential.py --config configs/config_xauusd_10y.yaml
+#   # or for multi-GPU:
+#   torchrun --standalone --nproc_per_node=NUM_GPUS train_sequential.py --config configs/config_xauusd_10y.yaml
+
+data:
+  data_path: "/Users/lgilbert/git/kronos/data/XAUUSD_1d_10y.csv"
+  lookback_window: 512      # daily bars of history; keep <= max_context (512)
+  predict_window: 30        # ~1 month of daily forecast
+  max_context: 512
+  clip: 5.0
+  # dataset split ratio (chronological). 0.7/0.3/0.0 so the val set is large
+  # enough to form real samples (see split math above).
+  train_ratio: 0.7
+  val_ratio: 0.3
+  test_ratio: 0.0
+
+training:
+  tokenizer_epochs: 30
+  basemodel_epochs: 20
+  batch_size: 32
+  # 28 steps/epoch for the tokenizer; log every 10 so we actually see step lines.
+  log_interval: 10
+  # 0 workers: the dataset is tiny and macOS spawn-based workers are flaky.
+  num_workers: 0
+  seed: 42
+
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.000001
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+
+  # gradient accumulation steps for tokenizer training
+  accumulation_steps: 1
+
+# model path configuration
+model_paths:
+  # Pre-trained checkpoints to start from (Hugging Face names or local paths).
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  pretrained_predictor: "NeoQuasar/Kronos-base"
+
+  # experiment name - other paths are generated from this
+  exp_name: "XAUUSD_1d_10y"
+  base_path: "/Users/lgilbert/git/kronos/finetune_csv/finetuned"
+
+  # leave empty -> auto-generated as {base_path}/{exp_name}
+  base_save_path: ""
+  finetuned_tokenizer: ""
+
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "kronos_xauusd_1d_10y_finetune"
+  description: "Fine-tune Kronos on daily XAUUSD (gold spot) k-line data (10y)"
+  use_comet: false
+
+  # control the training phases
+  train_tokenizer: true
+  train_basemodel: true
+
+  # start from the pre-trained weights (true) or random init (false)
+  pre_trained_tokenizer: true
+  pre_trained_predictor: true
+
+  # if true, skip re-training an already-existing checkpoint
+  skip_existing: false
+
+# device configuration
+# use_cuda: true means "use the best available accelerator". On Apple Silicon
+# the code falls back CUDA -> MPS -> CPU (see train_sequential._setup_device).
+device:
+  use_cuda: true
+  device_id: 0

@@ -288,7 +288,13 @@ def main():
     
     config = CustomFinetuneConfig(args.config)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Accelerator priority: CUDA -> MPS (Apple Silicon) -> CPU.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
     
     config = CustomFinetuneConfig(args.config)

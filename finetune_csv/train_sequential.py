@@ -27,12 +27,16 @@ class SequentialTrainer:
         self.config.print_config_summary()
     
     def _setup_device(self):
+        # Accelerator priority: CUDA -> MPS (Apple Silicon) -> CPU.
+        # use_cuda is treated as "use the best available accelerator".
         if self.config.use_cuda and torch.cuda.is_available():
             torch.cuda.set_device(self.local_rank)
             device = torch.device(f"cuda:{self.local_rank}")
+        elif self.config.use_cuda and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = torch.device("mps")
         else:
             device = torch.device("cpu")
-        
+
         if self.rank == 0:
             print(f"Using device: {device} (rank={self.rank}, world_size={self.world_size}, local_rank={self.local_rank})")
         return device
