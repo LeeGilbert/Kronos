@@ -177,6 +177,67 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         return z
 
 
+def expand_tokenizer_d_in(tokenizer, target_d_in):
+    """Expand a KronosTokenizer's input width from its current ``d_in`` to
+    ``target_d_in`` (>= current), preserving the pretrained weights.
+
+    A KronosTokenizer's ``d_in`` touches exactly two edge Linears::
+
+        embed = nn.Linear(d_in, d_model)   # input  -> model space
+        head  = nn.Linear(d_model, d_in)   # model space -> output
+
+    The entire backbone (encoder/decoder/quantizer) depends only on ``d_model``
+    and the codebook, so it is fully reusable. This rebuilds the two edge
+    layers at the new width, copying the pretrained weights into the first
+    ``old_d_in`` rows/columns and zero-initializing the new dimensions. With
+    the new input channel(s) set to 0 the expanded model is functionally
+    identical to the original (a clean warm start), so pretrained behaviour is
+    preserved and the new feature is learned on top.
+
+    The new layers are placed on the same device as the existing ``embed`` so
+    the call is safe whether or not the tokenizer has already been moved to a
+    GPU/accelerator.
+
+    NOTE: also updates ``tokenizer._hub_mixin_config['d_in']``. huggingface_hub
+    builds ``config.json`` from ``_hub_mixin_config`` (captured at ``__init__``
+    time, NOT re-read from the attribute at save time), so without this a
+    subsequent ``save_pretrained()`` / ``from_pretrained()`` round-trip would
+    silently keep the old width.
+    """
+    old_d_in = tokenizer.d_in
+    if target_d_in == old_d_in:
+        return tokenizer
+    if target_d_in < old_d_in:
+        raise ValueError(
+            f"Cannot shrink d_in from {old_d_in} to {target_d_in}; "
+            "only expansion is supported."
+        )
+
+    d_model = tokenizer.d_model
+    device = tokenizer.embed.weight.device
+    new_embed = nn.Linear(target_d_in, d_model).to(device)
+    new_head = nn.Linear(d_model, target_d_in).to(device)
+    with torch.no_grad():
+        # Zero the full weight AND bias first: nn.Linear random-inits every
+        # element, so the new dimensions would otherwise carry random weights.
+        new_embed.weight.zero_()
+        new_embed.bias.zero_()
+        new_head.weight.zero_()
+        new_head.bias.zero_()
+        # Copy the pretrained weights for the original dimensions.
+        new_embed.weight[:, :old_d_in] = tokenizer.embed.weight
+        new_embed.bias.copy_(tokenizer.embed.bias)
+        new_head.weight[:old_d_in, :] = tokenizer.head.weight
+        new_head.bias[:old_d_in].copy_(tokenizer.head.bias)
+
+    tokenizer.embed = new_embed
+    tokenizer.head = new_head
+    tokenizer.d_in = target_d_in
+    if hasattr(tokenizer, "_hub_mixin_config"):
+        tokenizer._hub_mixin_config["d_in"] = target_d_in
+    return tokenizer
+
+
 class Kronos(nn.Module, PyTorchModelHubMixin):
     """
     Kronos Model.

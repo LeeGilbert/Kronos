@@ -1,4 +1,4 @@
-from .kronos import KronosTokenizer, Kronos, KronosPredictor
+from .kronos import KronosTokenizer, Kronos, KronosPredictor, expand_tokenizer_d_in
 
 model_dict = {
     'kronos_tokenizer': KronosTokenizer,

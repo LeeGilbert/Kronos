@@ -16,7 +16,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.append("../")
-from model import KronosTokenizer
+from model import KronosTokenizer, expand_tokenizer_d_in
 from finetune_base_model import CustomKlineDataset
 from config_loader import CustomFinetuneConfig
 
@@ -103,7 +103,8 @@ def create_dataloaders(config):
         seed=config.seed,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio
+        test_ratio=config.test_ratio,
+        use_trailing_vol=getattr(config, 'use_trailing_vol', False)
     )
     
     val_dataset = CustomKlineDataset(
@@ -115,7 +116,8 @@ def create_dataloaders(config):
         seed=config.seed + 1,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio
+        test_ratio=config.test_ratio,
+        use_trailing_vol=getattr(config, 'use_trailing_vol', False)
     )
     
     use_ddp = dist.is_available() and dist.is_initialized()
@@ -336,6 +338,10 @@ def main():
             group_size=arch.get('group_size', 4)
         )
     tokenizer = tokenizer.to(device)
+    if getattr(config, 'use_trailing_vol', False):
+        # Expand the tokenizer's input width 6 -> 7 to accept the trailing-vol
+        # channel, preserving the pretrained weights (clean warm start).
+        tokenizer = expand_tokenizer_d_in(tokenizer, 7)
     
     model_size = get_model_size(tokenizer)
     logger.info(f"Tokenizer parameters: {model_size}")

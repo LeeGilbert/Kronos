@@ -25,7 +25,8 @@ from config_loader import CustomFinetuneConfig
 class CustomKlineDataset(Dataset):
     
     def __init__(self, data_path, data_type='train', lookback_window=90, predict_window=10, 
-                 clip=5.0, seed=100, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
+                 clip=5.0, seed=100, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,
+                 use_trailing_vol=False):
         self.data_path = data_path
         self.data_type = data_type
         self.lookback_window = lookback_window
@@ -36,8 +37,11 @@ class CustomKlineDataset(Dataset):
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
-        
+        self.use_trailing_vol = use_trailing_vol
+
         self.feature_list = ['open', 'high', 'low', 'close', 'volume', 'amount']
+        if use_trailing_vol:
+            self.feature_list = self.feature_list + ['trailing_vol']
         self.time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
         
         self.py_rng = random.Random(seed)
@@ -63,6 +67,14 @@ class CustomKlineDataset(Dataset):
         df['day'] = df['timestamps'].dt.day
         df['month'] = df['timestamps'].dt.month
         
+        if self.use_trailing_vol:
+            # Rolling realized vol of daily log-returns (backward-looking, so no
+            # look-ahead). Per-window z-scoring in __getitem__ turns this into a
+            # within-window vol *dynamics* feature (regime shifts); the absolute
+            # vol level is handled separately by the post-hoc vol calibration.
+            log_ret = np.log(df['close'] / df['close'].shift(1))
+            df['trailing_vol'] = log_ret.rolling(30, min_periods=2).std().bfill().fillna(0.0)
+
         self.data = df[self.feature_list + self.time_feature_list].copy()
         
         if self.data.isnull().any().any():
@@ -191,7 +203,8 @@ def create_dataloaders(config):
         seed=config.seed,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio
+        test_ratio=config.test_ratio,
+        use_trailing_vol=getattr(config, 'use_trailing_vol', False)
     )
     
     val_dataset = CustomKlineDataset(
@@ -203,7 +216,8 @@ def create_dataloaders(config):
         seed=config.seed + 1,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio
+        test_ratio=config.test_ratio,
+        use_trailing_vol=getattr(config, 'use_trailing_vol', False)
     )
     
     use_ddp = dist.is_available() and dist.is_initialized()

@@ -127,6 +127,7 @@ class CustomFinetuneConfig:
         self.train_ratio = data_config.get('train_ratio', 0.9)
         self.val_ratio = data_config.get('val_ratio', 0.1)
         self.test_ratio = data_config.get('test_ratio', 0.0)
+        self.use_trailing_vol = data_config.get('use_trailing_vol', False)
         
         # training configuration
         training_config = self.loader.get_training_config()

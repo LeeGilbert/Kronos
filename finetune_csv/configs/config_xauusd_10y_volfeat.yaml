@@ -1,0 +1,106 @@
+# Config for the TRAILING-VOL experiment: Kronos on XAUUSD (gold spot) DAILY
+# k-line CSV data (10y) with a 7th input channel.
+#
+# What this is
+#   A parallel experiment to config_xauusd_10y.yaml (the level model, which is
+#   left untouched). The tokenizer's input width is expanded 6 -> 7 and the new
+#   channel is the trailing realized vol of daily log-returns (30-day rolling
+#   std, backward-looking, no look-ahead). Per-window z-scoring turns it into a
+#   within-window vol *dynamics* feature (regime shifts), which is the targeted
+#   fix for the systematically under-dispersed ensemble (W3-type overconfidence:
+#   degenerate paths, 5x-capped post-hoc vol calibration).
+#
+#   The pretrained Kronos-Tokenizer-base is reused: only the two edge Linears
+#   (embed/head) are re-initialized, with the 7th dim zeroed so the warm start
+#   is functionally identical to the 6-dim model when the new channel is 0.
+#   The Kronos basemodel has no d_in and is reused as-is.
+#
+# Data: data/XAUUSD_1d_10y.csv  (2013 rows after cleaning, business days)
+#   Schema expected by CustomKlineDataset (finetune_csv/finetune_base_model.py):
+#     timestamps, open, high, low, close, volume, amount
+#   + trailing_vol (computed from close when use_trailing_vol: true)
+#
+# Run:
+#   cd finetune_csv
+#   .venv/bin/python train_sequential.py --config configs/config_xauusd_10y_volfeat.yaml
+#
+# Evaluate (from the repo root):
+#   .venv/bin/python examples/prediction_xauusd_day.py \
+#     --finetuned-dir finetune_csv/finetuned/XAUUSD_1d_10y_volfeat
+#   Compare vs the level-model baseline: raw ensemble-vol/realized-vol,
+#   coverage_90/coverage_50 per window (esp. W3-type), 30-day window-return
+#   correlation must hold (~0.732).
+
+data:
+  data_path: "/Users/lgilbert/git/kronos/data/XAUUSD_1d_10y.csv"
+  lookback_window: 512      # daily bars of history; keep <= max_context (512)
+  predict_window: 30        # ~1 month of daily forecast
+  max_context: 512
+  clip: 5.0
+  # dataset split ratio (chronological). 0.7/0.3/0.0 so the val set is large
+  # enough to form real samples (see config_xauusd_10y.yaml for the math).
+  train_ratio: 0.7
+  val_ratio: 0.3
+  test_ratio: 0.0
+  # 7th channel: trailing realized vol of daily log-returns (30-day window).
+  use_trailing_vol: true
+
+training:
+  tokenizer_epochs: 30
+  basemodel_epochs: 20
+  batch_size: 32
+  # 28 steps/epoch for the tokenizer; log every 10 so we actually see step lines.
+  log_interval: 10
+  # 0 workers: the dataset is tiny and macOS spawn-based workers are flaky.
+  num_workers: 0
+  seed: 42
+
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.000001
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+
+  # gradient accumulation steps for tokenizer training
+  accumulation_steps: 1
+
+# model path configuration
+model_paths:
+  # Pre-trained checkpoints to start from (Hugging Face names or local paths).
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  pretrained_predictor: "NeoQuasar/Kronos-base"
+
+  # experiment name - other paths are generated from this
+  exp_name: "XAUUSD_1d_10y_volfeat"
+  base_path: "/Users/lgilbert/git/kronos/finetune_csv/finetuned"
+
+  # leave empty -> auto-generated as {base_path}/{exp_name}
+  base_save_path: ""
+  finetuned_tokenizer: ""
+
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "kronos_xauusd_1d_10y_volfeat_finetune"
+  description: "Fine-tune Kronos on daily XAUUSD with a trailing-vol 7th channel (vol-dynamics experiment)"
+  use_comet: false
+
+  # control the training phases
+  train_tokenizer: true
+  train_basemodel: true
+
+  # start from the pre-trained weights (true) or random init (false)
+  pre_trained_tokenizer: true
+  pre_trained_predictor: true
+
+  # if true, skip re-training an already-existing checkpoint
+  skip_existing: false
+
+# device configuration
+# use_cuda: true means "use the best available accelerator". On Apple Silicon
+# the code falls back CUDA -> MPS -> CPU (see train_sequential._setup_device).
+device:
+  use_cuda: true
+  device_id: 0

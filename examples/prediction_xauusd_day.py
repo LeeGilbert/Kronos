@@ -90,24 +90,28 @@ os.makedirs(save_dir, exist_ok=True)
 # Model checkpoints: fine-tuned by default, pre-trained as fallback
 # ---------------------------------------------------------------------------
 FINETUNED_DIR = os.path.join(REPO_ROOT, "finetune_csv", "finetuned", "XAUUSD_1d_10y")
-FINETUNED_TOKENIZER = os.path.join(FINETUNED_DIR, "tokenizer", "best_model")
-FINETUNED_MODEL = os.path.join(FINETUNED_DIR, "basemodel", "best_model")
 PRETRAINED_TOKENIZER = "NeoQuasar/Kronos-Tokenizer-base"
 PRETRAINED_MODEL = "NeoQuasar/Kronos-base"
 
 
-def resolve_model_paths(use_pretrained: bool):
+def resolve_model_paths(use_pretrained: bool, finetuned_dir: str = None):
     """Pick tokenizer/model checkpoints.
 
     Fine-tuned checkpoints are preferred (they were trained on daily XAUUSD);
     the HF pre-trained models are used with --pretrained, or automatically if
     the fine-tuned directories do not exist yet.
+
+    `finetuned_dir` overrides the default fine-tuned experiment directory
+    (e.g. to point at the trailing-vol experiment: XAUUSD_1d_10y_volfeat).
     """
     if use_pretrained:
         return PRETRAINED_TOKENIZER, PRETRAINED_MODEL
-    if os.path.isdir(FINETUNED_TOKENIZER) and os.path.isdir(FINETUNED_MODEL):
-        return FINETUNED_TOKENIZER, FINETUNED_MODEL
-    print(f"⚠️  Fine-tuned checkpoints not found in {FINETUNED_DIR}")
+    base = finetuned_dir or FINETUNED_DIR
+    tok = os.path.join(base, "tokenizer", "best_model")
+    model = os.path.join(base, "basemodel", "best_model")
+    if os.path.isdir(tok) and os.path.isdir(model):
+        return tok, model
+    print(f"⚠️  Fine-tuned checkpoints not found in {base}")
     print("    Falling back to the HF pre-trained models (run finetune_csv/train_sequential.py first).")
     return PRETRAINED_TOKENIZER, PRETRAINED_MODEL
 
@@ -131,6 +135,8 @@ CLOSE_IDX = 3       # index of 'close' in the model's 6 output channels
 PRICE_IDX = (0, 1, 2, 3)  # open, high, low, close in the model's 6 output channels
 VOL_LOOKBACK = 30   # history days used to estimate the recent realized vol (vol-targeting)
 NORMAL = statistics.NormalDist()  # stdlib inverse normal CDF (scipy is not installed)
+TRAILING_VOL_COL = "trailing_vol"  # 7th model channel: rolling realized vol of daily log-returns
+TRAILING_VOL_WINDOW = 30           # matches VOL_LOOKBACK; backward-looking, so no look-ahead
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +154,12 @@ def load_data(csv_path: str) -> pd.DataFrame:
         if col in df.columns and (df[col] == 0).all():
             print(f"⚠️  Column '{col}' is all zeros -> dropping it (predictor will re-add zeros).")
             df = df.drop(columns=[col])
+
+    # Trailing realized vol of daily log-returns (backward-looking, no look-ahead).
+    # Becomes the 7th model channel when the tokenizer was expanded to d_in=7;
+    # per-window z-scoring turns it into a within-window vol *dynamics* feature.
+    log_ret = np.log(df["close"] / df["close"].shift(1))
+    df[TRAILING_VOL_COL] = log_ret.rolling(TRAILING_VOL_WINDOW, min_periods=2).std().bfill().fillna(0.0)
 
     print(f"✅ Loaded {len(df)} rows, range: {df['timestamps'].min().date()} ~ {df['timestamps'].max().date()}")
     print(df[["timestamps", "open", "high", "low", "close"]].tail(3).to_string(index=False))
@@ -182,7 +194,10 @@ def prepare_inputs(df: pd.DataFrame, lookback: int, pred_len: int,
         x_df = df.iloc[end - lookback:end]
         y_timestamp = df["timestamps"].iloc[end:end + pred_len]
 
-    x_df = x_df[["timestamps"] + PRICE_COLS]
+    cols = ["timestamps"] + PRICE_COLS
+    if TRAILING_VOL_COL in x_df.columns:
+        cols.append(TRAILING_VOL_COL)
+    x_df = x_df[cols]
     return x_df, pd.Series(x_df["timestamps"].values), pd.Series(y_timestamp.values)
 
 
@@ -295,8 +310,9 @@ def sample_paths(predictor: KronosPredictor, x_df: pd.DataFrame, x_timestamp: pd
     distribution (quantile bands, probability metrics).
 
     Returns:
-        np.ndarray of shape (n_paths, pred_len, 6) in the original price scale,
-        with channels [open, high, low, close, volume, amount].
+        np.ndarray of shape (n_paths, pred_len, n_channels) in the original
+        scale, with channels [open, high, low, close, volume, amount] and,
+        when the tokenizer was expanded to d_in=7, a trailing_vol channel.
     """
     price_cols = predictor.price_cols
     df = x_df.copy()
@@ -309,7 +325,13 @@ def sample_paths(predictor: KronosPredictor, x_df: pd.DataFrame, x_timestamp: pd
     x_time_df = calc_time_stamps(x_timestamp)
     y_time_df = calc_time_stamps(y_timestamp)
 
-    x = df[price_cols + [predictor.vol_col, predictor.amt_vol]].values.astype(np.float32)
+    feature_cols = list(price_cols) + [predictor.vol_col, predictor.amt_vol]
+    if predictor.tokenizer.d_in == 7:
+        # Expanded tokenizer: feed the trailing-vol channel as the 7th input.
+        if TRAILING_VOL_COL not in df.columns:
+            df[TRAILING_VOL_COL] = 0.0
+        feature_cols = feature_cols + [TRAILING_VOL_COL]
+    x = df[feature_cols].values.astype(np.float32)
     x_stamp = x_time_df.values.astype(np.float32)
     y_stamp = y_time_df.values.astype(np.float32)
 
@@ -712,8 +734,9 @@ def plot_result(df_hist: pd.DataFrame, pred_df: pd.DataFrame, summary: pd.DataFr
 def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
                    n_paths: int, T: float, top_k: int, top_p: float,
                    use_pretrained: bool, do_backtest: bool, n_backtest_windows: int,
-                   vol_calibration: bool = True, vol_shape: bool = True):
-    tok_name, model_name = resolve_model_paths(use_pretrained)
+                   vol_calibration: bool = True, vol_shape: bool = True,
+                   finetuned_dir: str = None):
+    tok_name, model_name = resolve_model_paths(use_pretrained, finetuned_dir)
     print(f"🚀 Loading Kronos tokenizer: {tok_name}")
     print(f"   Loading Kronos model:      {model_name}")
     tokenizer = KronosTokenizer.from_pretrained(tok_name)
@@ -732,10 +755,13 @@ def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
     if vol_calibration:
         paths = calibrate_vol(paths, x_df["close"].values, shape=vol_shape)
 
-    mean_path = paths.mean(axis=0)  # (pred_len, 6)
+    mean_path = paths.mean(axis=0)  # (pred_len, n_channels)
+    pred_cols = PRICE_COLS + ["volume", "amount"]
+    if paths.shape[-1] == 7:
+        pred_cols = pred_cols + [TRAILING_VOL_COL]
     pred_df = pd.DataFrame(
         mean_path,
-        columns=PRICE_COLS + ["volume", "amount"],
+        columns=pred_cols,
         index=pd.DatetimeIndex(y_timestamp.values, name="timestamps"),
     )
     summary = summarize_paths(paths, y_timestamp)
@@ -754,9 +780,12 @@ def predict_future(csv_path: str, lookback: int, pred_len: int, forward: bool,
     print(f"   worst path drawdown:      {metrics['max_drawdown']:.2%}")
 
     # Save history + mean forecast.
+    hist_cols = ["timestamps"] + PRICE_COLS
+    if TRAILING_VOL_COL in df.columns:
+        hist_cols.append(TRAILING_VOL_COL)
     df_out = pd.concat(
         [
-            df[["timestamps"] + PRICE_COLS].rename(columns={"timestamps": "date"}),
+            df[hist_cols].rename(columns={"timestamps": "date"}),
             pred_df.reset_index().rename(columns={"timestamps": "date"}),
         ],
         ignore_index=True,
@@ -787,6 +816,10 @@ if __name__ == "__main__":
                              "Use --no-forward for in-sample evaluation on the file's tail.")
     parser.add_argument("--pretrained", action="store_true",
                         help="Use the HF pre-trained Kronos models instead of the fine-tuned checkpoints")
+    parser.add_argument("--finetuned-dir", default=FINETUNED_DIR,
+                        help="Fine-tuned experiment directory to load checkpoints from "
+                             "(default: %(default)s; e.g. .../XAUUSD_1d_10y_volfeat for the "
+                             "trailing-vol experiment)")
     parser.add_argument("--sample-count", type=int, default=SAMPLE_COUNT,
                         help="Monte Carlo ensemble size")
     parser.add_argument("--temperature", type=float, default=T, help="Sampling temperature")
@@ -820,4 +853,5 @@ if __name__ == "__main__":
         n_backtest_windows=args.backtest_windows,
         vol_calibration=args.vol_calibration,
         vol_shape=args.vol_shape,
+        finetuned_dir=args.finetuned_dir,
     )

@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 import torch.distributed as dist
 
 sys.path.append('../')
-from model import Kronos, KronosTokenizer, KronosPredictor
+from model import Kronos, KronosTokenizer, KronosPredictor, expand_tokenizer_d_in
 
 from config_loader import CustomFinetuneConfig
 from finetune_tokenizer import train_tokenizer, set_seed, setup_logging as setup_tokenizer_logging
@@ -113,6 +113,10 @@ class SequentialTrainer:
                 group_size=arch.get('group_size', 4)
             )
         tokenizer = tokenizer.to(self.device)
+        if getattr(self.config, 'use_trailing_vol', False):
+            # Expand the tokenizer's input width 6 -> 7 to accept the trailing-vol
+            # channel, preserving the pretrained weights (clean warm start).
+            tokenizer = expand_tokenizer_d_in(tokenizer, 7)
         
         model_size = sum(p.numel() for p in tokenizer.parameters())
         logger.info(f"Tokenizer parameters: {model_size:,}")
