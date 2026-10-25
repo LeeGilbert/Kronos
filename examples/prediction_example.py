@@ -40,7 +40,7 @@ def plot_prediction(kline_df, pred_df):
 
 # 1. Load Model and Tokenizer
 tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
 
 # 2. Instantiate Predictor
 predictor = KronosPredictor(model, tokenizer, max_context=512)
@@ -62,9 +62,10 @@ pred_df = predictor.predict(
     x_timestamp=x_timestamp,
     y_timestamp=y_timestamp,
     pred_len=pred_len,
-    T=1.0,
-    top_p=0.9,
-    sample_count=1,
+    T=0.8,
+    top_p=0.7,
+    top_k=50,
+    sample_count=32,
     verbose=True
 )
 
