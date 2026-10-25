@@ -512,6 +512,12 @@ class KronosPredictor:
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
 
+        # The predictor is for inference only: switch to eval mode so dropout
+        # (and other train/eval-dependent modules) are disabled. This is required
+        # on the MPS backend, where scaled_dot_product_attention does not support
+        # a non-zero dropout_p, and is the correct behavior for prediction.
+        self.model.eval()
+
     def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
 
         x_tensor = torch.from_numpy(np.array(x).astype(np.float32)).to(self.device)

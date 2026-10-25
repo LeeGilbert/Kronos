@@ -4,14 +4,15 @@ import pandas as pd
 # Load secrets from .env (TIINGO_API_TOKEN) if python-dotenv is available.
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    import os
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except ImportError:
     pass
 
 client = TiingoClient()  # reads TIINGO_API_TOKEN from the environment
 
 end = datetime.now(timezone.utc)
-start = end - pd.DateOffset(years=5)
+start = end - pd.DateOffset(years=10)
 
 df = client.download_klines(
     symbol='XAUUSD',
@@ -33,7 +34,7 @@ out = pd.DataFrame({
     'amount': df['volume'],  # Tiingo forex has no amount; use volume as placeholder
 })
 
-out_path = 'data/XAUUSD_1d_5y.csv'
+out_path = 'data/XAUUSD_1d_10y.csv'
 out.to_csv(out_path, index=False)
 print(f'Saved to {out_path}')
 print(out.head())
